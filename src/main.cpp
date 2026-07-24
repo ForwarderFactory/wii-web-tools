@@ -4,6 +4,10 @@
 #include <string>
 #include <unordered_set>
 #include <netkit/http/sync_server.hpp>
+#include <netkit/body/file_body.hpp>
+#include <netkit/body/buffer_body.hpp>
+#include <netkit/http/multipart.hpp>
+#include <netkit/http/multipart_reader.hpp>
 #include <nlohmann/json.hpp>
 
 constexpr int PORT = 8080;
@@ -50,7 +54,7 @@ get_index(const netkit::http::server::request& req) {
     resp.content_type = "text/html";
     resp.http_status = 200;
 
-    resp.body = R"(
+    auto string = R"(
         <!DOCTYPE html>
         <html>
         <head>
@@ -68,6 +72,8 @@ get_index(const netkit::http::server::request& req) {
         </html>
         )";
 
+    resp.body = netkit::body::make_body<netkit::body::buffer_body>(string);
+
     return resp;
 }
 
@@ -77,7 +83,7 @@ get_banner_renderer_index(const netkit::http::server::request& req) {
     resp.content_type = "text/html";
     resp.http_status = 200;
 
-    resp.body = R"(
+    auto string = R"(
         <!DOCTYPE html>
         <html>
         <head>
@@ -182,6 +188,8 @@ get_banner_renderer_index(const netkit::http::server::request& req) {
         </html>
         )";
 
+    resp.body = netkit::body::make_body<netkit::body::buffer_body>(string);
+
     return resp;
 }
 
@@ -238,15 +246,46 @@ std::string sanitize_filename(const std::string& input) {
     return result;
 }
 
-void render_banner(const netkit::http::server::multipart_part* part, const std::string& key) {
-    if (!part) {
-        return;
+void render_banner(const netkit::http::server::request& req, const std::string& key) {
+    std::string boundary{};
+
+    if (req.headers.find("Content-Type") != req.headers.end()) {
+	    std::string content_type = req.headers.at("Content-Type");
+	    boundary = netkit::http::utility::extract_boundary(content_type);
     }
 
-    std::filesystem::path wd = TEMP_DIRECTORY + "/" + key + "/";
-    std::filesystem::path output_file = wd.string() + sanitize_filename(part->filename);
-    if (!std::filesystem::is_directory(wd)) {
-        std::filesystem::create_directories(wd);
+    netkit::http::utility::multipart_reader reader{*req.body, boundary};
+    netkit::http::utility::multipart_part part;
+
+    std::filesystem::path wd;
+    std::filesystem::path output_file;
+
+    if (reader.next(part)) {
+    	wd = TEMP_DIRECTORY + "/" + key + "/";
+    	output_file = wd.string() + sanitize_filename(part.filename);
+
+	if (!std::filesystem::is_directory(wd)) {
+        	std::filesystem::create_directories(wd);
+    	}
+
+	std::ofstream of{output_file, std::ofstream::binary};
+
+	char buffer[8192];
+	while (true) {
+		auto result = part.data->read(buffer, sizeof(buffer));
+
+		if (result.get_bytes_read() > 0) {
+			of.write(buffer, result.get_bytes_read());
+		}
+
+		if (result.get_status() == netkit::body::read_status::eof) {
+			break;
+		}
+
+		if (result.get_status() == netkit::body::read_status::error) {
+			throw std::runtime_error{"encountered an error"};
+		}
+	}
     }
 
     std::string output_video = output_file;
@@ -273,10 +312,6 @@ void render_banner(const netkit::http::server::multipart_part* part, const std::
         _tracker.render_status = status::processing;
     }
 
-    std::ofstream file(output_file, std::ios::binary | std::ios::trunc);
-    file << part->data;
-    file.close();
-
     std::thread([=]() {
         std::string cmd =
             "wii-banner-renderer -webm \"" +
@@ -297,8 +332,7 @@ void render_banner(const netkit::http::server::multipart_part* part, const std::
     }).detach();
 }
 
-netkit::http::server::response
-get_render_banner(const netkit::http::server::request& req) {
+netkit::http::server::response get_render_banner(const netkit::http::server::request& req) {
     netkit::http::server::response resp;
     resp.content_type = "application/json";
 
@@ -307,24 +341,7 @@ get_render_banner(const netkit::http::server::request& req) {
     if (req.method != "POST") {
         ret["error"] = "Invalid method";
         resp.http_status = 400;
-        resp.body = ret.dump();
-        return resp;
-    }
-
-    if (req.multipart.empty()) {
-        ret["error"] = "Invalid request";
-        resp.http_status = 400;
-        resp.body = ret.dump();
-        return resp;
-    }
-
-    const netkit::http::server::multipart_part* part = nullptr;
-    part = &req.multipart.front();
-
-    if (part == nullptr) {
-        ret["error"] = "Invalid multipart part";
-        resp.http_status = 400;
-        resp.body = ret.dump();
+    	resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
         return resp;
     }
 
@@ -332,9 +349,9 @@ get_render_banner(const netkit::http::server::request& req) {
 
     ret["render_id"] = key;
 
-    render_banner(part, key);
+    render_banner(req, key);
 
-    resp.body = ret.dump();
+    resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
 
     return resp;
 }
@@ -350,7 +367,7 @@ get_banner_index(const netkit::http::server::request& req) {
         nlohmann::json ret;
         ret["error"] = "Invalid request or server error";
         resp.http_status = 400;
-        resp.body = ret.dump();
+        resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
         return resp;
     }
 
@@ -360,24 +377,12 @@ get_banner_index(const netkit::http::server::request& req) {
         nlohmann::json ret;
         ret["error"] = "Invalid request or server error";
         resp.http_status = 400;
-        resp.body = ret.dump();
+        resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
         return resp;
     }
 
-    // read into resp.body
-    std::ifstream file(tracker.actual_filename, std::ios::binary);
-    if (!file.is_open()) {
-        nlohmann::json ret;
-        ret["error"] = "Invalid request or server error";
-        resp.http_status = 400;
-        resp.body = ret.dump();
-        return resp;
-    }
+    resp.body = netkit::body::make_body<netkit::body::file_body>(tracker.actual_filename);
 
-    resp.body = std::string(
-        std::istreambuf_iterator<char>(file),
-        std::istreambuf_iterator<char>()
-    );
     resp.content_type = "video/webm";
     resp.http_status = 200;
 
@@ -395,30 +400,31 @@ check_banner_status(const netkit::http::server::request& req) {
     if (req.method != "POST") {
         ret["error"] = "Invalid method";
         resp.http_status = 400;
-        resp.body = ret.dump();
+        resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
         return resp;
     }
 
     if (req.content_type != "application/json") {
         ret["error"] = "Invalid content type";
         resp.http_status = 400;
-        resp.body = ret.dump();
+        resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
         return resp;
     }
 
     try {
-        in = nlohmann::json::parse(req.body);
-    } catch (std::exception&) {
+        in = nlohmann::json::parse(req.body->read_all());
+    } catch (std::exception& e) {
+	std::cerr << e.what() << "\n";
         ret["error"] = "Invalid JSON";
         resp.http_status = 400;
-        resp.body = ret.dump();
+        resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
         return resp;
     }
 
     if (in.contains("id") == false || in.at("id").is_string() == false) {
         ret["error"] = "Invalid JSON (no id)";
         resp.http_status = 400;
-        resp.body = ret.dump();
+        resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
         return resp;
     }
 
@@ -426,14 +432,14 @@ check_banner_status(const netkit::http::server::request& req) {
     if (id.empty()) {
         ret["error"] = "Invalid JSON";
         resp.http_status = 400;
-        resp.body = ret.dump();
+        resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
         return resp;
     }
 
     if (!banner_trackers.contains(id)) {
         ret["error"] = "Invalid ID or no render started";
         resp.http_status = 400;
-        resp.body = ret.dump();
+        resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
         return resp;
     }
 
@@ -442,7 +448,7 @@ check_banner_status(const netkit::http::server::request& req) {
         case status::processing:
             ret["status"] = "processing";
             resp.http_status = 200;
-            resp.body = ret.dump();
+            resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
             return resp;
         case status::finished:
             ret["status"] = "finished";
@@ -454,13 +460,13 @@ check_banner_status(const netkit::http::server::request& req) {
     if (!std::filesystem::is_regular_file(tracker.actual_filename)) {
         ret["error"] = "Server error (file doesn't exist)";
         resp.http_status = 500;
-        resp.body = ret.dump();
+        resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
         return resp;
     }
 
     ret["download_webm"] = "/get/" + tracker.key;
 
-    resp.body = ret.dump();
+    resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
     return resp;
 }
 
@@ -502,7 +508,7 @@ int main(int argc, char** argv) {
             netkit::http::server::response resp;
 
             resp.http_status = 404;
-            resp.body = "404: Not found here. Oops.\n";
+    	    resp.body = netkit::body::make_body<netkit::body::buffer_body>(std::string("404: Not found here. Oops.\n"));
 
             return resp;
         });
