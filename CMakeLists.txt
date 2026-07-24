@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.2)
-project(wii_web_tools)
+project(wii-web-tools)
 
 set(CMAKE_CXX_STANDARD 23)
 
@@ -10,13 +10,13 @@ set(sources
         src/main.cpp
 )
 
-add_executable(wii_web_tools ${sources})
+add_executable(wii-web-tools ${sources})
 
-target_include_directories(wii_web_tools PRIVATE
+target_include_directories(wii-web-tools PRIVATE
         include
 )
 
-target_link_libraries(wii_web_tools PRIVATE
+target_link_libraries(wii-web-tools PRIVATE
         netkit::netkit
         nlohmann_json::nlohmann_json
 )

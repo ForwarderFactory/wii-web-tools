@@ -23,6 +23,13 @@ struct banner_tracker {
     std::atomic<status> render_status;
     std::string actual_filename{};
 
+    banner_tracker& operator=(const banner_tracker& other) {
+        key = other.key;
+        actual_filename = other.actual_filename;
+        render_status.store(other.render_status.load());
+        return *this;
+    }
+
     // we are using this struct so we can expand it later as needed
 };
 
@@ -249,7 +256,7 @@ std::string sanitize_filename(const std::string& input) {
 void render_banner(const netkit::http::server::request& req, const std::string& key) {
     std::string boundary{};
 
-    if (req.headers.find("Content-Type") != req.headers.end()) {
+    if (req.headers.contains("Content-Type")) {
 	    std::string content_type = req.headers.at("Content-Type");
 	    boundary = netkit::http::utility::extract_boundary(content_type);
     }
@@ -257,35 +264,34 @@ void render_banner(const netkit::http::server::request& req, const std::string& 
     netkit::http::utility::multipart_reader reader{*req.body, boundary};
     netkit::http::utility::multipart_part part;
 
-    std::filesystem::path wd;
     std::filesystem::path output_file;
 
     if (reader.next(part)) {
-    	wd = TEMP_DIRECTORY + "/" + key + "/";
+        std::filesystem::path wd = TEMP_DIRECTORY + "/" + key + "/";
     	output_file = wd.string() + sanitize_filename(part.filename);
 
-	if (!std::filesystem::is_directory(wd)) {
+	    if (!std::filesystem::is_directory(wd)) {
         	std::filesystem::create_directories(wd);
     	}
 
-	std::ofstream of{output_file, std::ofstream::binary};
+	    std::ofstream of{output_file, std::ofstream::binary};
 
-	char buffer[8192];
-	while (true) {
-		auto result = part.data->read(buffer, sizeof(buffer));
+	    char buffer[8192];
+	    while (true) {
+		    auto result = part.data->read(buffer, sizeof(buffer));
 
-		if (result.get_bytes_read() > 0) {
-			of.write(buffer, result.get_bytes_read());
-		}
+		    if (result.get_bytes_read() > 0) {
+			    of.write(buffer, static_cast<long>(result.get_bytes_read()));
+		    }
 
-		if (result.get_status() == netkit::body::read_status::eof) {
-			break;
-		}
+		    if (result.get_status() == netkit::body::read_status::eof) {
+			    break;
+		    }
 
-		if (result.get_status() == netkit::body::read_status::error) {
-			throw std::runtime_error{"encountered an error"};
-		}
-	}
+		    if (result.get_status() == netkit::body::read_status::error) {
+			    throw std::runtime_error{"encountered an error"};
+		    }
+	    }
     }
 
     std::string output_video = output_file;
@@ -359,11 +365,28 @@ netkit::http::server::response get_render_banner(const netkit::http::server::req
 netkit::http::server::response
 get_banner_index(const netkit::http::server::request& req) {
     netkit::http::server::response resp;
-
     resp.content_type = "application/json";
 
     std::string key = std::filesystem::path(req.endpoint).filename().string();
-    if (!banner_trackers.contains(key)) {
+
+    std::string filename;
+
+    {
+        std::lock_guard<std::mutex> lock(banner_trackers_mutex);
+
+        auto it = banner_trackers.find(key);
+        if (it == banner_trackers.end()) {
+            nlohmann::json ret;
+            ret["error"] = "Invalid request or server error";
+            resp.http_status = 400;
+            resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
+            return resp;
+        }
+
+        filename = it->second.actual_filename;
+    }
+
+    if (!std::filesystem::is_regular_file(filename)) {
         nlohmann::json ret;
         ret["error"] = "Invalid request or server error";
         resp.http_status = 400;
@@ -371,18 +394,7 @@ get_banner_index(const netkit::http::server::request& req) {
         return resp;
     }
 
-
-    const banner_tracker& tracker = banner_trackers[key];
-    if (!std::filesystem::is_regular_file(tracker.actual_filename)) {
-        nlohmann::json ret;
-        ret["error"] = "Invalid request or server error";
-        resp.http_status = 400;
-        resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
-        return resp;
-    }
-
-    resp.body = netkit::body::make_body<netkit::body::file_body>(tracker.actual_filename);
-
+    resp.body = netkit::body::make_body<netkit::body::file_body>(filename);
     resp.content_type = "video/webm";
     resp.http_status = 200;
 
@@ -436,14 +448,22 @@ check_banner_status(const netkit::http::server::request& req) {
         return resp;
     }
 
-    if (!banner_trackers.contains(id)) {
-        ret["error"] = "Invalid ID or no render started";
-        resp.http_status = 400;
-        resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
-        return resp;
+    banner_tracker tracker;
+
+    {
+        std::lock_guard<std::mutex> lock(banner_trackers_mutex);
+
+        auto it = banner_trackers.find(id);
+        if (it == banner_trackers.end()) {
+            ret["error"] = "Invalid ID or no render started";
+            resp.http_status = 400;
+            resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
+            return resp;
+        }
+
+        tracker = it->second;
     }
 
-    const banner_tracker& tracker = banner_trackers.at(id);
     switch (tracker.render_status) {
         case status::processing:
             ret["status"] = "processing";
