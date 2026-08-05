@@ -257,8 +257,8 @@ netkit::io::task<void>
 render_banner(const netkit::http::server::async_request& req, const std::string& key) {
     std::string boundary{};
 
-    if (req.headers.contains("Content-Type")) {
-	    std::string content_type = req.headers.at("Content-Type");
+    if (req.headers.contains("content-type")) {
+	    std::string content_type = req.headers.at("content-type");
 	    boundary = netkit::http::utility::extract_boundary(content_type);
     }
 
@@ -293,6 +293,8 @@ render_banner(const netkit::http::server::async_request& req, const std::string&
 			    throw std::runtime_error{"encountered an error"};
 		    }
 	    }
+    } else {
+        std::cerr << "No multipart\n";
     }
 
     std::string output_video = output_file;
