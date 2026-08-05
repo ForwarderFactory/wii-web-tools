@@ -528,8 +528,8 @@ netkit::io::task<void> run_server(netkit::io::io_context& ctx) {
             std::cout << it.first << ": " << it.second << "\n";
         }
 
-        if (req.headers.contains("Content-Length")) {
-            const auto& value = req.headers.at("Content-Length");
+        if (req.headers.contains("content-length")) {
+            const auto& value = req.headers.at("content-length");
 
             auto [ptr, ec] = std::from_chars(
                 value.data(),
