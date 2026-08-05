@@ -524,6 +524,10 @@ netkit::io::task<void> run_server(netkit::io::io_context& ctx) {
 
         std::size_t len = 0;
 
+        for (auto& it : req.headers) {
+            std::cout << it.first << ": " << it.second << "\n";
+        }
+
         if (req.headers.contains("Content-Length")) {
             const auto& value = req.headers.at("Content-Length");
 
