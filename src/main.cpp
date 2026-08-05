@@ -3,11 +3,11 @@
 #include <random>
 #include <string>
 #include <unordered_set>
-#include <netkit/http/sync_server.hpp>
-#include <netkit/body/file_body.hpp>
-#include <netkit/body/buffer_body.hpp>
+#include <netkit/http/async_server.hpp>
+#include <netkit/body/async_file_body.hpp>
+#include <netkit/body/async_buffer_body.hpp>
 #include <netkit/http/multipart.hpp>
-#include <netkit/http/multipart_reader.hpp>
+#include <netkit/http/async_multipart_reader.hpp>
 #include <nlohmann/json.hpp>
 
 constexpr int PORT = 8080;
@@ -55,9 +55,9 @@ std::string generate_random_string(const int length, const char* charset = defau
     return str;
 }
 
-netkit::http::server::response
-get_index(const netkit::http::server::request& req) {
-    netkit::http::server::response resp;
+netkit::io::task<netkit::http::server::async_response>
+get_index(const netkit::http::server::async_request& req) {
+    netkit::http::server::async_response resp;
     resp.content_type = "text/html";
     resp.http_status = 200;
 
@@ -79,14 +79,14 @@ get_index(const netkit::http::server::request& req) {
         </html>
         )";
 
-    resp.body = netkit::body::make_body<netkit::body::buffer_body>(string);
+    resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(string);
 
-    return resp;
+    co_return resp;
 }
 
-netkit::http::server::response
-get_banner_renderer_index(const netkit::http::server::request& req) {
-    netkit::http::server::response resp;
+netkit::io::task<netkit::http::server::async_response>
+get_banner_renderer_index(const netkit::http::server::async_request& req) {
+    netkit::http::server::async_response resp;
     resp.content_type = "text/html";
     resp.http_status = 200;
 
@@ -195,9 +195,9 @@ get_banner_renderer_index(const netkit::http::server::request& req) {
         </html>
         )";
 
-    resp.body = netkit::body::make_body<netkit::body::buffer_body>(string);
+    resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(string);
 
-    return resp;
+    co_return resp;
 }
 
 std::string sanitize_filename(const std::string& input) {
@@ -253,7 +253,8 @@ std::string sanitize_filename(const std::string& input) {
     return result;
 }
 
-void render_banner(const netkit::http::server::request& req, const std::string& key) {
+netkit::io::task<void>
+render_banner(const netkit::http::server::async_request& req, const std::string& key) {
     std::string boundary{};
 
     if (req.headers.contains("Content-Type")) {
@@ -261,12 +262,12 @@ void render_banner(const netkit::http::server::request& req, const std::string& 
 	    boundary = netkit::http::utility::extract_boundary(content_type);
     }
 
-    netkit::http::utility::multipart_reader reader{*req.body, boundary};
-    netkit::http::utility::multipart_part part;
+    netkit::http::utility::async_multipart_reader reader{*req.body, boundary};
+    netkit::http::utility::async_multipart_part part;
 
     std::filesystem::path output_file;
 
-    if (reader.next(part)) {
+    if (co_await reader.next(part)) {
         std::filesystem::path wd = TEMP_DIRECTORY + "/" + key + "/";
     	output_file = wd.string() + sanitize_filename(part.filename);
 
@@ -278,7 +279,7 @@ void render_banner(const netkit::http::server::request& req, const std::string& 
 
 	    char buffer[8192];
 	    while (true) {
-		    auto result = part.data->read(buffer, sizeof(buffer));
+		    auto result = co_await part.data->read(buffer, sizeof(buffer));
 
 		    if (result.get_bytes_read() > 0) {
 			    of.write(buffer, static_cast<long>(result.get_bytes_read()));
@@ -338,8 +339,9 @@ void render_banner(const netkit::http::server::request& req, const std::string& 
     }).detach();
 }
 
-netkit::http::server::response get_render_banner(const netkit::http::server::request& req) {
-    netkit::http::server::response resp;
+netkit::io::task<netkit::http::server::async_response>
+get_render_banner(const netkit::http::server::async_request& req) {
+    netkit::http::server::async_response resp;
     resp.content_type = "application/json";
 
     nlohmann::json ret;
@@ -347,24 +349,24 @@ netkit::http::server::response get_render_banner(const netkit::http::server::req
     if (req.method != "POST") {
         ret["error"] = "Invalid method";
         resp.http_status = 400;
-    	resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
-        return resp;
+    	resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(ret.dump());
+        co_return resp;
     }
 
     const std::string key = generate_random_string(32);
 
     ret["render_id"] = key;
 
-    render_banner(req, key);
+    co_await render_banner(req, key);
 
-    resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
+    resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(ret.dump());
 
-    return resp;
+    co_return resp;
 }
 
-netkit::http::server::response
-get_banner_index(const netkit::http::server::request& req) {
-    netkit::http::server::response resp;
+netkit::io::task<netkit::http::server::async_response>
+get_banner_index(const netkit::http::server::async_request& req) {
+    netkit::http::server::async_response resp;
     resp.content_type = "application/json";
 
     std::string key = std::filesystem::path(req.endpoint).filename().string();
@@ -379,8 +381,8 @@ get_banner_index(const netkit::http::server::request& req) {
             nlohmann::json ret;
             ret["error"] = "Invalid request or server error";
             resp.http_status = 400;
-            resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
-            return resp;
+            resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(ret.dump());
+            co_return resp;
         }
 
         filename = it->second.actual_filename;
@@ -390,20 +392,20 @@ get_banner_index(const netkit::http::server::request& req) {
         nlohmann::json ret;
         ret["error"] = "Invalid request or server error";
         resp.http_status = 400;
-        resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
-        return resp;
+        resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(ret.dump());
+        co_return resp;
     }
 
-    resp.body = netkit::body::make_body<netkit::body::file_body>(filename);
+    resp.body = netkit::body::make_body<netkit::body::async_file_body>(filename);
     resp.content_type = "video/webm";
     resp.http_status = 200;
 
-    return resp;
+    co_return resp;
 }
 
-netkit::http::server::response
-check_banner_status(const netkit::http::server::request& req) {
-    netkit::http::server::response resp;
+netkit::io::task<netkit::http::server::async_response>
+check_banner_status(const netkit::http::server::async_request& req, std::optional<std::size_t> len) {
+    netkit::http::server::async_response resp;
     resp.content_type = "application/json";
 
     nlohmann::json ret;
@@ -412,40 +414,41 @@ check_banner_status(const netkit::http::server::request& req) {
     if (req.method != "POST") {
         ret["error"] = "Invalid method";
         resp.http_status = 400;
-        resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
-        return resp;
+        resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(ret.dump());
+        co_return resp;
     }
 
     if (req.content_type != "application/json") {
         ret["error"] = "Invalid content type";
         resp.http_status = 400;
-        resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
-        return resp;
+        resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(ret.dump());
+        co_return resp;
     }
 
     try {
-        in = nlohmann::json::parse(req.body->read_all());
+        in = nlohmann::json::parse(co_await req.body->read_all(len));
     } catch (std::exception& e) {
-	std::cerr << e.what() << "\n";
+	    std::cerr << e.what() << "\n";
+
         ret["error"] = "Invalid JSON";
         resp.http_status = 400;
-        resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
-        return resp;
+        resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(ret.dump());
+        co_return resp;
     }
 
     if (in.contains("id") == false || in.at("id").is_string() == false) {
         ret["error"] = "Invalid JSON (no id)";
         resp.http_status = 400;
-        resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
-        return resp;
+        resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(ret.dump());
+        co_return resp;
     }
 
     std::string id = in["id"].get<std::string>();
     if (id.empty()) {
         ret["error"] = "Invalid JSON";
         resp.http_status = 400;
-        resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
-        return resp;
+        resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(ret.dump());
+        co_return resp;
     }
 
     banner_tracker tracker;
@@ -457,8 +460,8 @@ check_banner_status(const netkit::http::server::request& req) {
         if (it == banner_trackers.end()) {
             ret["error"] = "Invalid ID or no render started";
             resp.http_status = 400;
-            resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
-            return resp;
+            resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(ret.dump());
+            co_return resp;
         }
 
         tracker = it->second;
@@ -468,8 +471,8 @@ check_banner_status(const netkit::http::server::request& req) {
         case status::processing:
             ret["status"] = "processing";
             resp.http_status = 200;
-            resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
-            return resp;
+            resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(ret.dump());
+            co_return resp;
         case status::finished:
             ret["status"] = "finished";
             resp.http_status = 200;
@@ -480,62 +483,103 @@ check_banner_status(const netkit::http::server::request& req) {
     if (!std::filesystem::is_regular_file(tracker.actual_filename)) {
         ret["error"] = "Server error (file doesn't exist)";
         resp.http_status = 500;
-        resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
-        return resp;
+        resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(ret.dump());
+        co_return resp;
     }
 
     ret["download_webm"] = "/get/" + tracker.key;
 
-    resp.body = netkit::body::make_body<netkit::body::buffer_body>(ret.dump());
-    return resp;
+    resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(ret.dump());
+    co_return resp;
 }
 
-int main(int argc, char** argv) {
-    netkit::http::server::sync_server server(
-        netkit::http::server::server_settings{
-        .port = PORT,
-        .enable_session = false,
-        .trust_x_forwarded_for = true,
-        },
-        [&](const netkit::http::server::request& req) -> netkit::http::server::response {
-            std::cout << "Received request from: " << req.ip_address << "\n"
-                      << "Endpoint: " << req.endpoint << "\n"
-                      << "Method: " << req.method << "\n"
-                      << "User-Agent: " << req.user_agent << "\n";
-            //          << "Body: " << req.body << "\n";
+constexpr std::size_t MAX_REQUEST_SIZE = 128000000;
 
-            auto endpoint = req.endpoint;
+netkit::io::task<void> run_server(netkit::io::io_context& ctx) {
+    netkit::http::server::async_server server(
+    ctx,
+    netkit::http::server::server_settings{
+    .port = PORT,
+    .enable_session = false,
+    .trust_x_forwarded_for = true,
+    },
+    [&](const netkit::http::server::async_request& req) -> netkit::io::task<netkit::http::server::async_response> {
+        std::cout << "Received request from: " << req.ip_address << "\n"
+                  << "Endpoint: " << req.endpoint << "\n"
+                  << "Method: " << req.method << "\n"
+                  << "User-Agent: " << req.user_agent << "\n";
+        //          << "Body: " << req.body << "\n";
 
-            // trim trailing
-            if (endpoint.back() == '/') {
-                endpoint.pop_back();
+        auto endpoint = req.endpoint;
+
+        // trim trailing
+        if (endpoint.back() == '/') {
+            endpoint.pop_back();
+        }
+
+        std::size_t len = 0;
+
+        if (req.headers.contains("Content-Length")) {
+            const auto& value = req.headers.at("Content-Length");
+
+            auto [ptr, ec] = std::from_chars(
+                value.data(),
+                value.data() + value.size(),
+                len
+            );
+
+            if (ec != std::errc{} || ptr != value.data() + value.size()) {
+                netkit::http::server::async_response resp;
+                resp.http_status = 400;
+                resp.content_type = "text/plain";
+                resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(std::string("400: Invalid Content-Length header"));
+                co_return resp;
             }
 
-            if (endpoint.empty()) {
-                return get_index(req);
-            } else if (endpoint == "/banner-renderer") {
-                return get_banner_renderer_index(req);
-            } else if (endpoint == "/api/render-banner") {
-                auto response = get_render_banner(req);
-                std::cout << response.body << std::endl;
-                return response;
-            } else if (endpoint == "/api/check_banner_status") {
-                return check_banner_status(req);
-            } else if (endpoint.starts_with("/get")) {
-                return get_banner_index(req);
+            if (len > MAX_REQUEST_SIZE) {
+                netkit::http::server::async_response resp;
+                resp.http_status = 413;
+                resp.content_type = "text/plain";
+                resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(std::string("413: Payload too large"));
+                co_return resp;
             }
+        }
 
-            netkit::http::server::response resp;
+        if (endpoint.empty()) {
+            co_return co_await get_index(req);
+        } else if (endpoint == "/banner-renderer") {
+            co_return co_await get_banner_renderer_index(req);
+        } else if (endpoint == "/api/render-banner") {
+            co_return co_await get_render_banner(req);
+        } else if (endpoint == "/api/check_banner_status") {
+            if (!len && req.headers.contains("Connection") && req.headers.at("Connection") != "close") {
+                netkit::http::server::async_response resp;
+                resp.http_status = 400;
+                resp.content_type = "text/plain";
+                resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(std::string("400: Invalid Content-Length header"));
+                co_return resp;
+            }
+            co_return co_await check_banner_status(req, len);
+        } else if (endpoint.starts_with("/get")) {
+            co_return co_await get_banner_index(req);
+        }
 
-            resp.http_status = 404;
-    	    resp.body = netkit::body::make_body<netkit::body::buffer_body>(std::string("404: Not found here. Oops.\n"));
+        netkit::http::server::async_response resp;
+        resp.http_status = 404;
+        resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(std::string("404: Not found here. Oops.\n"));
 
-            return resp;
-        });
+        co_return resp;
+    });
+
+    co_await server.run();
+    co_return;
+}
+
+[[noreturn]] int main(int argc, char** argv) {
+    netkit::io::io_context ctx;
 
     std::cout << "Server started on port " << PORT << std::endl;
 
-    server.run();
-
-    return EXIT_SUCCESS;
+    ctx.spawn(run_server(ctx));
+    ctx.run();
 }
