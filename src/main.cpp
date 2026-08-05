@@ -319,6 +319,11 @@ render_banner(const netkit::http::server::async_request& req, const std::string&
         _tracker.render_status = status::processing;
     }
 
+    if (!std::filesystem::exists(output_file)) {
+        std::cout << co_await req.body->read_all();
+        co_return;
+    }
+
     std::thread([=]() {
         std::string cmd =
             "wii-banner-renderer -webm \"" +
@@ -499,9 +504,9 @@ netkit::io::task<void> run_server(netkit::io::io_context& ctx) {
     netkit::http::server::async_server server(
     ctx,
     netkit::http::server::server_settings{
-    .port = PORT,
-    .enable_session = false,
-    .trust_x_forwarded_for = true,
+        .port = PORT,
+        .enable_session = false,
+        .trust_x_forwarded_for = true,
     },
     [&](const netkit::http::server::async_request& req) -> netkit::io::task<netkit::http::server::async_response> {
         std::cout << "Received request from: " << req.ip_address << "\n"
@@ -575,11 +580,13 @@ netkit::io::task<void> run_server(netkit::io::io_context& ctx) {
     co_return;
 }
 
-[[noreturn]] int main(int argc, char** argv) {
+int main(int argc, char** argv) {
     netkit::io::io_context ctx;
 
     std::cout << "Server started on port " << PORT << std::endl;
 
     ctx.spawn(run_server(ctx));
     ctx.run();
+
+    return EXIT_SUCCESS;
 }
