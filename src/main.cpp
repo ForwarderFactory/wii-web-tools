@@ -431,7 +431,9 @@ check_banner_status(const netkit::http::server::async_request& req, std::optiona
     }
 
     try {
-        in = nlohmann::json::parse(co_await req.body->read_all(len));
+        auto data = co_await req.body->read_all(len);
+        std::cout << data << "\n";
+        in = nlohmann::json::parse(data);
     } catch (std::exception& e) {
 	    std::cerr << e.what() << "\n";
 
