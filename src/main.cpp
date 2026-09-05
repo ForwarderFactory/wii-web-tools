@@ -3,15 +3,20 @@
 #include <random>
 #include <string>
 #include <unordered_set>
+#include <vector>
+
 #include <netkit/http/async_server.hpp>
 #include <netkit/body/async_file_body.hpp>
 #include <netkit/body/async_buffer_body.hpp>
 #include <netkit/http/multipart.hpp>
 #include <netkit/http/async_multipart_reader.hpp>
+
 #include <nlohmann/json.hpp>
 
 constexpr int PORT = 8080;
 const std::string TEMP_DIRECTORY = "/tmp/wii-banner-renderer";
+constexpr std::size_t MAX_FILES_PER_REQUEST = 5;
+constexpr std::size_t MAX_REQUEST_SIZE = 128000000;
 
 enum class status {
     processing,
@@ -100,33 +105,77 @@ get_banner_renderer_index(const netkit::http::server::async_request& req) {
                 #video_container {
                     display: none;
                 }
+                .render_card {
+                    border: 1px solid #ccc;
+                    border-radius: 6px;
+                    padding: 10px;
+                    margin-bottom: 10px;
+                }
+                .render_card video {
+                    max-width: 480px;
+                    display: block;
+                }
             </style>
         </head>
         <body>
             <h1>Wii Banner Renderer</h1>
                 <p>Render your Wii channels into playable video files in your browser.</p>
+                <p>You can select up to 5 .wad files at once.</p>
                 <p>For more options, check out the <a href="https://github.com/ForwarderFactory/wii-banner-renderer">wii-banner-renderer</a> program.</p>
 
                 <form id="upload_form" method="POST" enctype="multipart/form-data">
-                    <input type="file" name="wad" accept=".wad" required>
+                    <input type="file" id="wad_input" name="wad" accept=".wad" multiple required>
                     <button type="submit">Render</button>
                 </form>
 
-                <div id="progress"></div>
-                <div id="video_container">
-                    <video id="video_player" controls></video>
-                    <br>
-                    <a id="download_link">Download video</a>
-                </div>
+                <div id="renders"></div>
 
                 <script>
-                const form = document.getElementById('upload_form');
-                const progress = document.getElementById('progress');
-                const video_container = document.getElementById('video_container');
-                const video_player = document.getElementById('video_player');
-                const download_link = document.getElementById('download_link');
+                const MAX_FILES = 5;
 
-                function poll_render(render_id) {
+                const form = document.getElementById('upload_form');
+                const wad_input = document.getElementById('wad_input');
+                const renders = document.getElementById('renders');
+
+                wad_input.addEventListener('change', () => {
+                    if (wad_input.files.length > MAX_FILES) {
+                        alert(`Please select at most ${MAX_FILES} files.`);
+                        wad_input.value = '';
+                    }
+                });
+
+                function create_render_card(name) {
+                    const card = document.createElement('div');
+                    card.className = 'render_card';
+
+                    const title = document.createElement('p');
+                    title.textContent = name;
+
+                    const progress = document.createElement('div');
+                    progress.textContent = 'queued';
+
+                    const video_container = document.createElement('div');
+                    video_container.style.display = 'none';
+
+                    const video_player = document.createElement('video');
+                    video_player.controls = true;
+
+                    const download_link = document.createElement('a');
+                    download_link.textContent = 'Download video';
+
+                    video_container.appendChild(video_player);
+                    video_container.appendChild(document.createElement('br'));
+                    video_container.appendChild(download_link);
+
+                    card.appendChild(title);
+                    card.appendChild(progress);
+                    card.appendChild(video_container);
+                    renders.appendChild(card);
+
+                    return { progress, video_container, video_player, download_link };
+                }
+
+                function poll_render(render_id, ui) {
                     const interval = setInterval(async () => {
                         const res = await fetch("/api/check_banner_status", {
                             method: "POST",
@@ -142,36 +191,47 @@ get_banner_renderer_index(const netkit::http::server::async_request& req) {
 
                         if (!json || !json.status) {
                             clearInterval(interval);
-                            progress.textContent = "failure. sorry :(";
-                            return
+                            ui.progress.textContent = "failure. sorry :(";
+                            return;
                         }
 
                         const status = json.status;
 
                         if (status === "finished") {
                             clearInterval(interval);
-                            progress.textContent = "finished :O";
+                            ui.progress.textContent = "finished :O";
 
-                            video_player.src = json.download_webm;
-                            video_player.load();
+                            ui.video_player.src = json.download_mp4;
+                            ui.video_player.load();
 
-                            video_container.style.display = "block";
-
-                            download_link.href = json.download_webm;
+                            ui.video_container.style.display = "block";
+                            ui.download_link.href = json.download_mp4;
                         } else if (status === "processing") {
-                            progress.textContent = "working";
+                            ui.progress.textContent = "working";
                         }
 
                         if (status === "error" || json.error) {
                             clearInterval(interval);
-                            progress.textContent = "failure. sorry :(";
+                            ui.progress.textContent = "failure. sorry :(";
                         }
                     }, 2500);
                 }
 
                 form.addEventListener('submit', async (e) => {
                     e.preventDefault();
-                    progress.textContent = "uploading file";
+                    renders.innerHTML = '';
+
+                    if (wad_input.files.length === 0) {
+                        return;
+                    }
+
+                    if (wad_input.files.length > MAX_FILES) {
+                        alert(`Please select at most ${MAX_FILES} files.`);
+                        return;
+                    }
+
+                    const uis = Array.from(wad_input.files).map(f => create_render_card(f.name));
+                    uis.forEach(ui => ui.progress.textContent = 'uploading file');
 
                     const form_data = new FormData(form);
                     const res = await fetch('/api/render-banner', {
@@ -181,13 +241,17 @@ get_banner_renderer_index(const netkit::http::server::async_request& req) {
 
                     const data = await res.json();
 
-                    if (!data.render_id) {
-                        progress.textContent = "failure. sorry :(";
+                    if (!data.render_ids || !Array.isArray(data.render_ids) || data.render_ids.length === 0) {
+                        uis.forEach(ui => ui.progress.textContent = 'failure. sorry :(');
                         return;
                     }
 
-                    const render_id = data.render_id;
-                    poll_render(render_id);
+                    // render_ids come back in the same order the files were read server-side,
+                    // which matches the order they were appended to the form.
+                    data.render_ids.forEach((render_id, i) => {
+                        const ui = uis[i] || create_render_card(`file ${i + 1}`);
+                        poll_render(render_id, ui);
+                    });
                 });
 
                 </script>
@@ -253,62 +317,48 @@ std::string sanitize_filename(const std::string& input) {
     return result;
 }
 
-netkit::io::task<void>
-render_banner(const netkit::http::server::async_request& req, const std::string& key) {
-    std::string boundary{};
+netkit::io::task<std::optional<std::string>>
+save_and_start_render(netkit::http::utility::async_multipart_part& part) {
+    const std::string key = generate_random_string(32);
 
-    if (req.headers.contains("content-type")) {
-	    std::string content_type = req.headers.at("content-type");
-	    boundary = netkit::http::utility::extract_boundary(content_type);
+    std::filesystem::path wd = TEMP_DIRECTORY + "/" + key + "/";
+    std::filesystem::path output_file = wd.string() + sanitize_filename(part.filename);
+
+    if (!std::filesystem::is_directory(wd)) {
+        std::filesystem::create_directories(wd);
     }
 
-    netkit::http::utility::async_multipart_reader reader{*req.body, boundary};
-    netkit::http::utility::async_multipart_part part;
+    {
+        std::ofstream of{output_file, std::ofstream::binary};
 
-    std::filesystem::path output_file;
+        char buffer[8192];
+        while (true) {
+            auto result = co_await part.data->read(buffer, sizeof(buffer));
 
-    if (co_await reader.next(part)) {
-        std::filesystem::path wd = TEMP_DIRECTORY + "/" + key + "/";
-    	output_file = wd.string() + sanitize_filename(part.filename);
+            if (result.get_bytes_read() > 0) {
+                of.write(buffer, static_cast<long>(result.get_bytes_read()));
+            }
 
-	    if (!std::filesystem::is_directory(wd)) {
-        	std::filesystem::create_directories(wd);
-    	}
+            if (result.get_status() == netkit::body::read_status::eof) {
+                break;
+            }
 
-	    std::ofstream of{output_file, std::ofstream::binary};
-
-	    char buffer[8192];
-	    while (true) {
-		    auto result = co_await part.data->read(buffer, sizeof(buffer));
-
-		    if (result.get_bytes_read() > 0) {
-			    of.write(buffer, static_cast<long>(result.get_bytes_read()));
-		    }
-
-		    if (result.get_status() == netkit::body::read_status::eof) {
-			    break;
-		    }
-
-		    if (result.get_status() == netkit::body::read_status::error) {
-			    throw std::runtime_error{"encountered an error"};
-		    }
-	    }
-    } else {
-        std::cerr << "No multipart\n";
+            if (result.get_status() == netkit::body::read_status::error) {
+                throw std::runtime_error{"encountered an error"};
+            }
+        }
     }
 
-    std::string output_video = output_file;
+    if (!std::filesystem::exists(output_file)) {
+        co_return std::nullopt;
+    }
+
+    std::string output_video = output_file.string();
     auto ext = output_video.find_last_of('.');
     if (ext != std::string::npos) {
         output_video = output_video.substr(0, ext);
     }
-
-    output_video += ".webm";
-
-    banner_tracker tracker;
-    tracker.render_status = status::processing;
-    tracker.key = key;
-    tracker.actual_filename = output_video;
+    output_video += ".mp4";
 
     {
         std::lock_guard<std::mutex> lock(banner_trackers_mutex);
@@ -321,14 +371,9 @@ render_banner(const netkit::http::server::async_request& req, const std::string&
         _tracker.render_status = status::processing;
     }
 
-    if (!std::filesystem::exists(output_file)) {
-        std::cout << co_await req.body->read_all();
-        co_return;
-    }
-
-    std::thread([=]() {
+    std::thread([output_file, output_video, key]() {
         std::string cmd =
-            "wii-banner-renderer -webm \"" +
+            "wbr \"" +
             output_file.string() +
             "\" -o \"" +
             output_video + "\"";
@@ -344,6 +389,37 @@ render_banner(const netkit::http::server::async_request& req, const std::string&
             }
         }
     }).detach();
+
+    co_return key;
+}
+
+netkit::io::task<std::vector<std::string>>
+render_banners(const netkit::http::server::async_request& req) {
+    std::string boundary{};
+
+    if (req.headers.contains("content-type")) {
+        std::string content_type = req.headers.at("content-type");
+        boundary = netkit::http::utility::extract_boundary(content_type);
+    }
+
+    netkit::http::utility::async_multipart_reader reader{*req.body, boundary};
+    netkit::http::utility::async_multipart_part part;
+
+    std::vector<std::string> keys;
+
+    while (keys.size() < MAX_FILES_PER_REQUEST && co_await reader.next(part)) {
+        auto key = co_await save_and_start_render(part);
+
+        if (key.has_value()) {
+            keys.push_back(*key);
+        }
+    }
+
+    if (keys.empty()) {
+        std::cerr << "No multipart\n";
+    }
+
+    co_return keys;
 }
 
 netkit::io::task<netkit::http::server::async_response>
@@ -356,15 +432,20 @@ get_render_banner(const netkit::http::server::async_request& req) {
     if (req.method != "POST") {
         ret["error"] = "Invalid method";
         resp.http_status = 400;
-    	resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(ret.dump());
+        resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(ret.dump());
         co_return resp;
     }
 
-    const std::string key = generate_random_string(32);
+    std::vector<std::string> keys = co_await render_banners(req);
 
-    ret["render_id"] = key;
+    if (keys.empty()) {
+        ret["error"] = "No files uploaded";
+        resp.http_status = 400;
+        resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(ret.dump());
+        co_return resp;
+    }
 
-    co_await render_banner(req, key);
+    ret["render_ids"] = keys;
 
     resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(ret.dump());
 
@@ -404,7 +485,7 @@ get_banner_index(const netkit::http::server::async_request& req) {
     }
 
     resp.body = netkit::body::make_body<netkit::body::async_file_body>(filename);
-    resp.content_type = "video/webm";
+    resp.content_type = "video/mp4";
     resp.http_status = 200;
 
     co_return resp;
@@ -437,7 +518,7 @@ check_banner_status(const netkit::http::server::async_request& req, std::optiona
         std::cout << data << "\n";
         in = nlohmann::json::parse(data);
     } catch (std::exception& e) {
-	    std::cerr << e.what() << "\n";
+        std::cerr << e.what() << "\n";
 
         ret["error"] = "Invalid JSON";
         resp.http_status = 400;
@@ -496,13 +577,11 @@ check_banner_status(const netkit::http::server::async_request& req, std::optiona
         co_return resp;
     }
 
-    ret["download_webm"] = "/get/" + tracker.key;
+    ret["download_mp4"] = "/get/" + tracker.key;
 
     resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(ret.dump());
     co_return resp;
 }
-
-constexpr std::size_t MAX_REQUEST_SIZE = 128000000;
 
 netkit::io::task<void> run_server(netkit::io::io_context& ctx) {
     netkit::http::server::async_server server(
@@ -517,7 +596,6 @@ netkit::io::task<void> run_server(netkit::io::io_context& ctx) {
                   << "Endpoint: " << req.endpoint << "\n"
                   << "Method: " << req.method << "\n"
                   << "User-Agent: " << req.user_agent << "\n";
-        //          << "Body: " << req.body << "\n";
 
         auto endpoint = req.endpoint;
 
