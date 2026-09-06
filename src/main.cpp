@@ -227,6 +227,8 @@ get_banner_renderer_index(const netkit::http::server::async_request& req) {
                         if (!json || !json.status) {
                             clearInterval(interval);
                             ui.progress.textContent = "failure. sorry :(";
+                            ui.video_container.style.display = "none";
+                            ui.video_player.style.display = "none";
                             return;
                         }
 
@@ -236,11 +238,11 @@ get_banner_renderer_index(const netkit::http::server::async_request& req) {
                             clearInterval(interval);
                             ui.progress.textContent = "finished :O";
 
-                            ui.video_player.src = json.download_webm;
+                            ui.video_player.src = json.download_mp4;
                             ui.video_player.load();
 
                             ui.video_container.style.display = "block";
-                            ui.download_link.href = json.download_webm;
+                            ui.download_link.href = json.download_mp4;
                         } else if (status === "processing") {
                             ui.progress.textContent = "working";
                         }
@@ -248,6 +250,8 @@ get_banner_renderer_index(const netkit::http::server::async_request& req) {
                         if (status === "error" || json.error) {
                             clearInterval(interval);
                             ui.progress.textContent = "failure. sorry :(";
+                            ui.video_container.style.display = "none";
+                            ui.video_player.style.display = "none";
                         }
                     }, 2500);
                 }
@@ -577,7 +581,7 @@ save_and_start_render(netkit::http::utility::async_multipart_part& part, bool ad
     if (ext != std::string::npos) {
         output_video = output_video.substr(0, ext);
     }
-    output_video += ".webm";
+    output_video += ".mp4";
 
     {
         std::lock_guard<std::mutex> lock(banner_trackers_mutex);
@@ -734,7 +738,7 @@ get_banner_index(const netkit::http::server::async_request& req) {
     }
 
     resp.body = netkit::body::make_body<netkit::body::async_file_body>(filename);
-    resp.content_type = "video/webm";
+    resp.content_type = "video/mp4";
     resp.http_status = 200;
 
     co_return resp;
@@ -826,7 +830,7 @@ check_banner_status(const netkit::http::server::async_request& req, std::optiona
         co_return resp;
     }
 
-    ret["download_webm"] = "/get/" + tracker.key;
+    ret["download_mp4"] = "/get/" + tracker.key;
 
     resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(ret.dump());
     co_return resp;
