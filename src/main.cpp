@@ -1,7 +1,18 @@
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <netkit/http/async_server.hpp>
@@ -13,8 +24,133 @@
 
 constexpr int PORT = 8080;
 const std::string TEMP_DIRECTORY = "/tmp/wii-banner-renderer";
+const std::string RENDERS_INDEX_FILE = TEMP_DIRECTORY + "/renders_index.json";
 constexpr std::size_t MAX_FILES_PER_REQUEST = 5;
 constexpr std::size_t MAX_REQUEST_SIZE = 128000000;
+constexpr auto RENDER_TTL = std::chrono::hours(24 * 14); // 2 weeks
+constexpr auto CLEANUP_INTERVAL = std::chrono::hours(1);
+constexpr std::size_t MAX_RECENT_RENDERS = 24;
+
+namespace sha256_impl {
+    struct sha256_ctx {
+        std::uint32_t state[8] = {
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+            0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+        };
+        std::uint64_t bit_len = 0;
+        std::uint8_t buffer[64]{};
+        std::size_t buffer_len = 0;
+    };
+
+    inline std::uint32_t rotr(std::uint32_t x, std::uint32_t n) { return (x >> n) | (x << (32 - n)); }
+
+    inline void transform(sha256_ctx& ctx, const std::uint8_t* data) {
+        static constexpr std::uint32_t k[64] = {
+            0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+            0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+            0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+            0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+            0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+            0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+            0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+            0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+        };
+
+        std::uint32_t w[64];
+        for (int i = 0; i < 16; ++i) {
+            w[i] = (static_cast<std::uint32_t>(data[i * 4]) << 24) |
+                   (static_cast<std::uint32_t>(data[i * 4 + 1]) << 16) |
+                   (static_cast<std::uint32_t>(data[i * 4 + 2]) << 8) |
+                   (static_cast<std::uint32_t>(data[i * 4 + 3]));
+        }
+        for (int i = 16; i < 64; ++i) {
+            std::uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+            std::uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+
+        std::uint32_t a = ctx.state[0], b = ctx.state[1], c = ctx.state[2], d = ctx.state[3];
+        std::uint32_t e = ctx.state[4], f = ctx.state[5], g = ctx.state[6], h = ctx.state[7];
+
+        for (int i = 0; i < 64; ++i) {
+            std::uint32_t s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+            std::uint32_t ch = (e & f) ^ (~e & g);
+            std::uint32_t temp1 = h + s1 + ch + k[i] + w[i];
+            std::uint32_t s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+            std::uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            std::uint32_t temp2 = s0 + maj;
+
+            h = g; g = f; f = e; e = d + temp1;
+            d = c; c = b; b = a; a = temp1 + temp2;
+        }
+
+        ctx.state[0] += a; ctx.state[1] += b; ctx.state[2] += c; ctx.state[3] += d;
+        ctx.state[4] += e; ctx.state[5] += f; ctx.state[6] += g; ctx.state[7] += h;
+    }
+
+    inline void update(sha256_ctx& ctx, const std::uint8_t* data, std::size_t len) {
+        ctx.bit_len += static_cast<std::uint64_t>(len) * 8;
+
+        while (len > 0) {
+            std::size_t to_copy = std::min(len, sizeof(ctx.buffer) - ctx.buffer_len);
+            std::memcpy(ctx.buffer + ctx.buffer_len, data, to_copy);
+            ctx.buffer_len += to_copy;
+            data += to_copy;
+            len -= to_copy;
+
+            if (ctx.buffer_len == sizeof(ctx.buffer)) {
+                transform(ctx, ctx.buffer);
+                ctx.buffer_len = 0;
+            }
+        }
+    }
+
+    inline std::string finalize(sha256_ctx& ctx) {
+        std::uint64_t bit_len = ctx.bit_len;
+
+        std::uint8_t pad = 0x80;
+        update(ctx, &pad, 1);
+
+        std::uint8_t zero = 0x00;
+        while (ctx.buffer_len != 56) {
+            update(ctx, &zero, 1);
+        }
+
+        std::uint8_t len_bytes[8];
+        for (int i = 0; i < 8; ++i) {
+            len_bytes[i] = static_cast<std::uint8_t>(bit_len >> (56 - i * 8));
+        }
+        // append length directly to avoid recursing through update()'s padding logic
+        std::memcpy(ctx.buffer + ctx.buffer_len, len_bytes, 8);
+        transform(ctx, ctx.buffer);
+
+        static constexpr char hex_chars[] = "0123456789abcdef";
+        std::string result;
+        result.reserve(64);
+        for (std::uint32_t s : ctx.state) {
+            for (int shift = 24; shift >= 0; shift -= 8) {
+                std::uint8_t byte = static_cast<std::uint8_t>(s >> shift);
+                result += hex_chars[byte >> 4];
+                result += hex_chars[byte & 0x0F];
+            }
+        }
+        return result;
+    }
+}
+
+class streaming_hasher {
+public:
+    void update(const char* data, std::size_t len) {
+        sha256_impl::update(ctx_, reinterpret_cast<const std::uint8_t*>(data), len);
+    }
+
+    std::string hex_digest() {
+        return sha256_impl::finalize(ctx_);
+    }
+
+private:
+    sha256_impl::sha256_ctx ctx_{};
+};
 
 enum class status {
     processing,
@@ -25,10 +161,20 @@ struct banner_tracker {
     std::string key{};
     std::atomic<status> render_status;
     std::string actual_filename{};
+    std::string original_filename{};
+    std::string content_hash{};
+    bool icon{false};
+    bool hidden{false};
+    std::int64_t uploaded_at{0};
 
     banner_tracker& operator=(const banner_tracker& other) {
         key = other.key;
         actual_filename = other.actual_filename;
+        original_filename = other.original_filename;
+        content_hash = other.content_hash;
+        icon = other.icon;
+        hidden = other.hidden;
+        uploaded_at = other.uploaded_at;
         render_status.store(other.render_status.load());
         return *this;
     }
@@ -36,6 +182,113 @@ struct banner_tracker {
 
 std::unordered_map<std::string, banner_tracker> banner_trackers;
 std::mutex banner_trackers_mutex;
+
+std::int64_t now_unix_seconds() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+}
+
+void save_renders_index_locked() {
+    nlohmann::json out = nlohmann::json::object();
+
+    for (const auto& [key, tracker] : banner_trackers) {
+        out[key] = {
+            {"actual_filename", tracker.actual_filename},
+            {"original_filename", tracker.original_filename},
+            {"content_hash", tracker.content_hash},
+            {"icon", tracker.icon},
+            {"hidden", tracker.hidden},
+            {"uploaded_at", tracker.uploaded_at},
+            {"finished", tracker.render_status.load() == status::finished},
+        };
+    }
+
+    std::ofstream of{RENDERS_INDEX_FILE, std::ofstream::trunc};
+    of << out.dump();
+}
+
+void load_renders_index() {
+    if (!std::filesystem::is_regular_file(RENDERS_INDEX_FILE)) {
+        return;
+    }
+
+    nlohmann::json in;
+    try {
+        std::ifstream ifs{RENDERS_INDEX_FILE};
+        in = nlohmann::json::parse(ifs);
+    } catch (std::exception& e) {
+        std::cerr << "Failed to load renders index: " << e.what() << "\n";
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(banner_trackers_mutex);
+
+    for (auto it = in.begin(); it != in.end(); ++it) {
+        const std::string& key = it.key();
+        const auto& v = it.value();
+
+        std::string actual_filename = v.value("actual_filename", "");
+        bool finished = v.value("finished", false);
+
+        if (!finished || !std::filesystem::is_regular_file(actual_filename)) {
+            continue;
+        }
+
+        banner_tracker tracker;
+        tracker.key = key;
+        tracker.actual_filename = actual_filename;
+        tracker.original_filename = v.value("original_filename", "");
+        tracker.content_hash = v.value("content_hash", "");
+        tracker.icon = v.value("icon", false);
+        tracker.hidden = v.value("hidden", false);
+        tracker.uploaded_at = v.value("uploaded_at", static_cast<std::int64_t>(0));
+        tracker.render_status = status::finished;
+
+        banner_trackers[key] = tracker;
+    }
+
+    std::cout << "Loaded " << banner_trackers.size() << " render(s) from index\n";
+}
+
+void cleanup_old_renders() {
+    while (true) {
+        std::this_thread::sleep_for(CLEANUP_INTERVAL);
+
+        auto cutoff = now_unix_seconds() - std::chrono::duration_cast<std::chrono::seconds>(RENDER_TTL).count();
+        std::vector<std::string> expired_keys;
+
+        {
+            std::lock_guard<std::mutex> lock(banner_trackers_mutex);
+
+            for (const auto& [key, tracker] : banner_trackers) {
+                if (tracker.uploaded_at != 0 && tracker.uploaded_at < cutoff) {
+                    expired_keys.push_back(key);
+                }
+            }
+
+            for (const auto& key : expired_keys) {
+                banner_trackers.erase(key);
+            }
+
+            if (!expired_keys.empty()) {
+                save_renders_index_locked();
+            }
+        }
+
+        for (const auto& key : expired_keys) {
+            std::error_code ec;
+            std::filesystem::remove_all(std::filesystem::path(TEMP_DIRECTORY) / key, ec);
+            if (ec) {
+                std::cerr << "Failed to remove expired render " << key << ": " << ec.message() << "\n";
+            }
+        }
+
+        if (!expired_keys.empty()) {
+            std::cout << "Cleanup: removed " << expired_keys.size() << " render(s) older than 2 weeks\n";
+        }
+    }
+}
 
 static constexpr char default_charset[] =
     "0123456789"
@@ -115,6 +368,8 @@ get_banner_renderer_index(const netkit::http::server::async_request& req) {
                     <button type="submit" id="submit_button" disabled>Render</button>
                 </form>
                 <div id="renders"></div>
+                <h2>Recently rendered</h2>
+                <div id="recently_rendered"></div>
                 <h2>Having issues?</h2>
                 <p>Wii Banner Renderer is open source software, based on the work of the Wii Banner Player Project.</p>
                 <p>Report any issues with rendering <a href="https://github.com/ForwarderFactory/wii-banner-renderer">here</a> using the 'broken forwarder' label.</p>
@@ -157,11 +412,18 @@ get_banner_renderer_index(const netkit::http::server::async_request& req) {
                         label.appendChild(icon_checkbox);
                         label.appendChild(document.createTextNode(' Icon'));
 
+                        const hidden_label = document.createElement('label');
+                        const hidden_checkbox = document.createElement('input');
+                        hidden_checkbox.type = 'checkbox';
+                        hidden_label.appendChild(hidden_checkbox);
+                        hidden_label.appendChild(document.createTextNode(' Hide from recently rendered'));
+
                         row.appendChild(name);
                         row.appendChild(label);
+                        row.appendChild(hidden_label);
                         file_list.appendChild(row);
 
-                        selected_files.push({ file, icon_checkbox });
+                        selected_files.push({ file, icon_checkbox, hidden_checkbox });
                     }
 
                     submit_button.disabled = selected_files.length === 0;
@@ -256,6 +518,47 @@ get_banner_renderer_index(const netkit::http::server::async_request& req) {
                     }, 2500);
                 }
 
+                async function load_recently_rendered() {
+                    const container = document.getElementById('recently_rendered');
+
+                    try {
+                        const res = await fetch('/api/recent');
+                        const items = await res.json();
+
+                        if (!Array.isArray(items) || items.length === 0) {
+                            container.innerHTML = '<p>Nothing rendered yet.</p>';
+                            return;
+                        }
+
+                        container.innerHTML = '';
+                        for (const item of items) {
+                            const card = document.createElement('div');
+                            card.className = 'render_card';
+
+                            const title = document.createElement('p');
+                            title.textContent = item.filename || 'render';
+
+                            const video = document.createElement('video');
+                            video.controls = true;
+                            video.src = item.download_mp4;
+
+                            const link = document.createElement('a');
+                            link.href = item.download_mp4;
+                            link.textContent = 'Download video';
+
+                            card.appendChild(title);
+                            card.appendChild(video);
+                            card.appendChild(document.createElement('br'));
+                            card.appendChild(link);
+                            container.appendChild(card);
+                        }
+                    } catch (e) {
+                        container.innerHTML = '<p>Could not load recent renders.</p>';
+                    }
+                }
+
+                load_recently_rendered();
+
                 form.addEventListener('submit', async (e) => {
                     e.preventDefault();
                     renders.innerHTML = '';
@@ -273,8 +576,9 @@ get_banner_renderer_index(const netkit::http::server::async_request& req) {
                     uis.forEach(ui => ui.progress.textContent = 'uploading file');
 
                     const form_data = new FormData();
-                    for (const { file, icon_checkbox } of selected_files) {
+                    for (const { file, icon_checkbox, hidden_checkbox } of selected_files) {
                         form_data.append('icon', icon_checkbox.checked ? '1' : '0');
+                        form_data.append('hidden', hidden_checkbox.checked ? '1' : '0');
                         form_data.append('wad', file, file.name);
                     }
 
@@ -541,15 +845,18 @@ std::string sanitize_filename(const std::string& input) {
 }
 
 netkit::io::task<std::optional<std::string>>
-save_and_start_render(netkit::http::utility::async_multipart_part& part, bool add_icon) {
+save_and_start_render(netkit::http::utility::async_multipart_part& part, bool add_icon, bool hidden) {
     const std::string key = generate_random_string(32);
 
     std::filesystem::path wd = TEMP_DIRECTORY + "/" + key + "/";
-    std::filesystem::path output_file = wd.string() + sanitize_filename(part.filename);
+    std::string sanitized_name = sanitize_filename(part.filename);
+    std::filesystem::path output_file = wd.string() + sanitized_name;
 
     if (!std::filesystem::is_directory(wd)) {
         std::filesystem::create_directories(wd);
     }
+
+    streaming_hasher hasher;
 
     {
         std::ofstream of{output_file, std::ofstream::binary};
@@ -560,6 +867,7 @@ save_and_start_render(netkit::http::utility::async_multipart_part& part, bool ad
 
             if (result.get_bytes_read() > 0) {
                 of.write(buffer, static_cast<long>(result.get_bytes_read()));
+                hasher.update(buffer, result.get_bytes_read());
             }
 
             if (result.get_status() == netkit::body::read_status::eof) {
@@ -574,6 +882,37 @@ save_and_start_render(netkit::http::utility::async_multipart_part& part, bool ad
 
     if (!std::filesystem::exists(output_file)) {
         co_return std::nullopt;
+    }
+
+    std::string content_hash = hasher.hex_digest();
+
+    {
+        std::lock_guard<std::mutex> lock(banner_trackers_mutex);
+
+        for (auto& [existing_key, tracker] : banner_trackers) {
+            if (tracker.render_status.load() != status::finished) continue;
+            if (tracker.content_hash != content_hash) continue;
+            if (tracker.icon != add_icon) continue;
+            if (!std::filesystem::is_regular_file(tracker.actual_filename)) continue;
+
+            std::error_code ec;
+            std::filesystem::remove_all(wd, ec);
+
+            banner_tracker cache_hit;
+            cache_hit.key = key;
+            cache_hit.actual_filename = tracker.actual_filename;
+            cache_hit.original_filename = sanitized_name;
+            cache_hit.content_hash = content_hash;
+            cache_hit.icon = add_icon;
+            cache_hit.hidden = hidden;
+            cache_hit.uploaded_at = now_unix_seconds();
+            cache_hit.render_status = status::finished;
+
+            banner_trackers[key] = cache_hit;
+            save_renders_index_locked();
+
+            co_return key;
+        }
     }
 
     std::string output_video = output_file.string();
@@ -591,7 +930,14 @@ save_and_start_render(netkit::http::utility::async_multipart_part& part, bool ad
 
         _tracker.key = key;
         _tracker.actual_filename = output_video;
+        _tracker.original_filename = sanitized_name;
+        _tracker.content_hash = content_hash;
+        _tracker.icon = add_icon;
+        _tracker.hidden = hidden;
+        _tracker.uploaded_at = now_unix_seconds();
         _tracker.render_status = status::processing;
+
+        save_renders_index_locked();
     }
 
     std::thread([output_file, output_video, key, add_icon]() {
@@ -613,6 +959,7 @@ save_and_start_render(netkit::http::utility::async_multipart_part& part, bool ad
             auto it = banner_trackers.find(key);
             if (it != banner_trackers.end()) {
                 it->second.render_status = status::finished;
+                save_renders_index_locked();
             }
         }
     }).detach();
@@ -635,6 +982,7 @@ render_banners(const netkit::http::server::async_request& req) {
     std::vector<std::string> keys;
 
     bool pending_icon = false;
+    bool pending_hidden = false;
 
     while (keys.size() < MAX_FILES_PER_REQUEST && co_await reader.next(part)) {
         if (part.filename.empty()) {
@@ -656,12 +1004,17 @@ render_banners(const netkit::http::server::async_request& req) {
                 }
             }
 
-            pending_icon = (value == "1");
+            if (part.name == "hidden") {
+                pending_hidden = (value == "1");
+            } else {
+                pending_icon = (value == "1");
+            }
             continue;
         }
 
-        auto key = co_await save_and_start_render(part, pending_icon);
+        auto key = co_await save_and_start_render(part, pending_icon, pending_hidden);
         pending_icon = false;
+        pending_hidden = false;
 
         if (key.has_value()) {
             keys.push_back(*key);
@@ -741,6 +1094,53 @@ get_banner_index(const netkit::http::server::async_request& req) {
     resp.content_type = "video/mp4";
     resp.http_status = 200;
 
+    co_return resp;
+}
+
+netkit::io::task<netkit::http::server::async_response>
+get_recent_renders(const netkit::http::server::async_request& req) {
+    netkit::http::server::async_response resp;
+    resp.content_type = "application/json";
+    resp.http_status = 200;
+
+    struct entry {
+        std::string key;
+        std::string filename;
+        std::int64_t uploaded_at;
+    };
+
+    std::vector<entry> entries;
+
+    {
+        std::lock_guard<std::mutex> lock(banner_trackers_mutex);
+
+        for (const auto& [key, tracker] : banner_trackers) {
+            if (tracker.hidden) continue;
+            if (tracker.render_status.load() != status::finished) continue;
+            if (!std::filesystem::is_regular_file(tracker.actual_filename)) continue;
+
+            entries.push_back({key, tracker.original_filename, tracker.uploaded_at});
+        }
+    }
+
+    std::ranges::sort(entries, [](const entry& a, const entry& b) {
+        return a.uploaded_at > b.uploaded_at;
+    });
+
+    if (entries.size() > MAX_RECENT_RENDERS) {
+        entries.resize(MAX_RECENT_RENDERS);
+    }
+
+    nlohmann::json ret = nlohmann::json::array();
+    for (const auto& e : entries) {
+        ret.push_back({
+            {"filename", e.filename},
+            {"uploaded_at", e.uploaded_at},
+            {"download_mp4", "/get/" + e.key},
+        });
+    }
+
+    resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(ret.dump());
     co_return resp;
 }
 
@@ -906,6 +1306,8 @@ netkit::io::task<void> run_server(netkit::io::io_context& ctx) {
                 co_return resp;
             }
             co_return co_await check_banner_status(req, len);
+        } else if (endpoint == "/api/recent") {
+            co_return co_await get_recent_renders(req);
         } else if (endpoint.starts_with("/get")) {
             co_return co_await get_banner_index(req);
         }
@@ -922,6 +1324,11 @@ netkit::io::task<void> run_server(netkit::io::io_context& ctx) {
 }
 
 int main(int argc, char** argv) {
+    std::filesystem::create_directories(TEMP_DIRECTORY);
+
+    load_renders_index();
+    std::thread(cleanup_old_renders).detach();
+
     netkit::io::io_context ctx;
 
     std::cout << "Server started on port " << PORT << std::endl;
