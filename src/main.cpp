@@ -251,7 +251,7 @@ void load_renders_index() {
     std::cout << "Loaded " << banner_trackers.size() << " render(s) from index\n";
 }
 
-void cleanup_old_renders() {
+[[noreturn]] void cleanup_old_renders() {
     while (true) {
         std::this_thread::sleep_for(CLEANUP_INTERVAL);
 
@@ -369,7 +369,11 @@ get_banner_renderer_index(const netkit::http::server::async_request& req) {
                 </form>
                 <div id="renders"></div>
                 <h2>Recently rendered</h2>
-                <div id="recently_rendered"></div>
+                <div class="carousel">
+                    <button type="button" class="carousel_btn carousel_left" aria-label="Scroll left">&#8249;</button>
+                    <div id="recently_rendered" class="carousel_track"></div>
+                    <button type="button" class="carousel_btn carousel_right" aria-label="Scroll right">&#8250;</button>
+                </div>
                 <h2>Having issues?</h2>
                 <p>Wii Banner Renderer is open source software, based on the work of the Wii Banner Player Project.</p>
                 <p>Report any issues with rendering <a href="https://github.com/ForwarderFactory/wii-banner-renderer">here</a> using the 'broken forwarder' label.</p>
@@ -412,6 +416,16 @@ get_banner_renderer_index(const netkit::http::server::async_request& req) {
                         label.appendChild(icon_checkbox);
                         label.appendChild(document.createTextNode(' Icon'));
 
+                        const both_label = document.createElement('label');
+                        const both_checkbox = document.createElement('input');
+                        both_checkbox.type = 'checkbox';
+                        both_label.appendChild(both_checkbox);
+                        both_label.appendChild(document.createTextNode(' Render both icon & banner'));
+
+                        both_checkbox.addEventListener('change', () => {
+                            icon_checkbox.disabled = both_checkbox.checked;
+                        });
+
                         const hidden_label = document.createElement('label');
                         const hidden_checkbox = document.createElement('input');
                         hidden_checkbox.type = 'checkbox';
@@ -420,10 +434,11 @@ get_banner_renderer_index(const netkit::http::server::async_request& req) {
 
                         row.appendChild(name);
                         row.appendChild(label);
+                        row.appendChild(both_label);
                         row.appendChild(hidden_label);
                         file_list.appendChild(row);
 
-                        selected_files.push({ file, icon_checkbox, hidden_checkbox });
+                        selected_files.push({ file, icon_checkbox, both_checkbox, hidden_checkbox });
                     }
 
                     submit_button.disabled = selected_files.length === 0;
@@ -531,6 +546,7 @@ get_banner_renderer_index(const netkit::http::server::async_request& req) {
                         }
 
                         container.innerHTML = '';
+
                         for (const item of items) {
                             const card = document.createElement('div');
                             card.className = 'render_card';
@@ -539,17 +555,29 @@ get_banner_renderer_index(const netkit::http::server::async_request& req) {
                             title.textContent = item.filename || 'render';
 
                             const video = document.createElement('video');
-                            video.controls = true;
                             video.src = item.download_mp4;
+                            video.preload = 'metadata';
 
-                            const link = document.createElement('a');
-                            link.href = item.download_mp4;
-                            link.textContent = 'Download video';
+                            video.addEventListener('mouseenter', () => {
+                                video.play().catch(() => {});
+                            });
+
+                            video.addEventListener('mouseleave', () => {
+                                video.pause();
+                                video.currentTime = 0;
+                            });
+
+                            video.addEventListener('click', () => {
+                                const link = document.createElement('a');
+                                link.href = item.download_mp4;
+                                link.download = item.filename || 'render.mp4';
+                                document.body.appendChild(link);
+                                link.click();
+                                link.remove();
+                            });
 
                             card.appendChild(title);
                             card.appendChild(video);
-                            card.appendChild(document.createElement('br'));
-                            card.appendChild(link);
                             container.appendChild(card);
                         }
                     } catch (e) {
@@ -558,6 +586,23 @@ get_banner_renderer_index(const netkit::http::server::async_request& req) {
                 }
 
                 load_recently_rendered();
+
+                const recentlyRendered = document.getElementById('recently_rendered');
+
+                recentlyRendered.addEventListener('wheel', (e) => {
+                    if (e.deltaY === 0) return;
+
+                    e.preventDefault();
+                    recentlyRendered.scrollLeft += e.deltaY;
+                }, { passive: false });
+
+                document.querySelector('.carousel_left').addEventListener('click', () => {
+                    document.getElementById('recently_rendered').scrollBy({ left: -300, behavior: 'smooth' });
+                });
+
+                document.querySelector('.carousel_right').addEventListener('click', () => {
+                    document.getElementById('recently_rendered').scrollBy({ left: 300, behavior: 'smooth' });
+                });
 
                 form.addEventListener('submit', async (e) => {
                     e.preventDefault();
@@ -572,33 +617,48 @@ get_banner_renderer_index(const netkit::http::server::async_request& req) {
                         return;
                     }
 
-                    const uis = selected_files.map(({ file }) => create_render_card(file.name));
-                    uis.forEach(ui => ui.progress.textContent = 'uploading file');
+                    const jobs = [];
+                    for (const { file, icon_checkbox, both_checkbox, hidden_checkbox } of selected_files) {
+                        const hidden = hidden_checkbox.checked;
 
-                    const form_data = new FormData();
-                    for (const { file, icon_checkbox, hidden_checkbox } of selected_files) {
-                        form_data.append('icon', icon_checkbox.checked ? '1' : '0');
-                        form_data.append('hidden', hidden_checkbox.checked ? '1' : '0');
-                        form_data.append('wad', file, file.name);
+                        if (both_checkbox.checked) {
+                            jobs.push({ file, icon: true, hidden, label: `${file.name} (icon)` });
+                            jobs.push({ file, icon: false, hidden, label: `${file.name} (banner)` });
+                        } else {
+                            jobs.push({ file, icon: icon_checkbox.checked, hidden, label: file.name });
+                        }
                     }
 
-                    const res = await fetch('/api/render-banner', {
-                        method: 'POST',
-                        body: form_data
+                    jobs.forEach(job => {
+                        job.ui = create_render_card(job.label);
+                        job.ui.progress.textContent = 'uploading file';
                     });
 
-                    const data = await res.json();
+                    await Promise.all(jobs.map(async (job) => {
+                        const form_data = new FormData();
+                        form_data.append('icon', job.icon ? '1' : '0');
+                        form_data.append('hidden', job.hidden ? '1' : '0');
+                        form_data.append('wad', job.file, job.file.name);
 
-                    if (!data.render_ids || !Array.isArray(data.render_ids) || data.render_ids.length === 0) {
-                        uis.forEach(ui => ui.progress.textContent = 'failure. sorry :(');
-                        return;
-                    }
+                        try {
+                            const res = await fetch('/api/render-banner', {
+                                method: 'POST',
+                                body: form_data
+                            });
 
-                    // render_ids come back in the same order the files were appended above.
-                    data.render_ids.forEach((render_id, i) => {
-                        const ui = uis[i] || create_render_card(`file ${i + 1}`);
-                        poll_render(render_id, ui);
-                    });
+                            const data = await res.json();
+                            const render_id = data.render_ids && data.render_ids[0];
+
+                            if (!render_id) {
+                                job.ui.progress.textContent = 'failure. sorry :(';
+                                return;
+                            }
+
+                            poll_render(render_id, job.ui);
+                        } catch (e) {
+                            job.ui.progress.textContent = 'failure. sorry :(';
+                        }
+                    }));
                 });
 
                 </script>
@@ -784,6 +844,53 @@ get_banner_renderer_style(const netkit::http::server::async_request& req) {
             font-size: 0.85rem;
             font-weight: 600;
         }
+
+        .carousel {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 12px;
+        }
+
+        .carousel_track {
+            display: flex;
+            gap: 12px;
+            overflow-x: auto;
+            scroll-behavior: smooth;
+            padding-bottom: 4px;
+            flex: 1;
+            scrollbar-width: none;
+        }
+
+        html::-webkit-scrollbar {
+            display: none;
+        }
+
+        .carousel_track .render_card {
+            flex: 0 0 220px;
+            margin-bottom: 0;
+        }
+
+        .carousel_btn {
+            flex: 0 0 auto;
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            border: 1px solid var(--border);
+            background: var(--card-bg);
+            color: var(--text);
+            font-size: 1.1rem;
+            line-height: 1;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.15s ease;
+        }
+
+        .carousel_btn:hover {
+            background: var(--border);
+        }
         )";
 
     resp.body = netkit::body::make_body<netkit::body::async_buffer_body>(string);
@@ -889,7 +996,7 @@ save_and_start_render(netkit::http::utility::async_multipart_part& part, bool ad
     {
         std::lock_guard<std::mutex> lock(banner_trackers_mutex);
 
-        for (auto& [existing_key, tracker] : banner_trackers) {
+        for (auto &tracker: banner_trackers | std::views::values) {
             if (tracker.render_status.load() != status::finished) continue;
             if (tracker.content_hash != content_hash) continue;
             if (tracker.icon != add_icon) continue;
